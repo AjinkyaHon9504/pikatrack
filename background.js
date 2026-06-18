@@ -2,6 +2,12 @@ const DB_NAME = 'pikadex_v3';
 const DB_VERSION = 3;
 const POPUP_RECORD_LIMIT = 350;
 const SYNC_CACHE_TTL_MS = 5 * 60 * 1000;
+const GITHUB_LIVE_CACHE_TTL_MS = 60 * 1000;
+const ACCOUNT_LIVE_SYNC_TTL_MS = 60 * 1000;
+const GITHUB_API_HEADERS = {
+  'Accept': 'application/vnd.github+json',
+  'X-GitHub-Api-Version': '2022-11-28'
+};
 let db = null;
 
 chrome.runtime.onInstalled.addListener(async (details) => {
@@ -9,6 +15,50 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     chrome.tabs.create({ url: chrome.runtime.getURL('welcome.html') });
   }
 });
+
+function storageGet(keys) {
+  return new Promise(resolve => {
+    chrome.storage.local.get(keys, value => resolve(value || {}));
+  });
+}
+
+function storageSet(values) {
+  return new Promise(resolve => {
+    chrome.storage.local.set(values, () => resolve());
+  });
+}
+
+function storageRemove(keys) {
+  return new Promise(resolve => {
+    chrome.storage.local.remove(keys, () => resolve());
+  });
+}
+
+function sendTabMessage(tabId, payload) {
+  try {
+    chrome.tabs.sendMessage(tabId, payload, () => {
+      void chrome.runtime.lastError;
+    });
+  } catch (error) {
+    console.warn('PikaDex: tab message skipped:', describeSyncError(error));
+  }
+}
+
+function tabsGet(tabId) {
+  return new Promise(resolve => {
+    try {
+      chrome.tabs.get(tabId, tab => {
+        if (chrome.runtime.lastError) {
+          resolve(null);
+          return;
+        }
+        resolve(tab || null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
 
 function openDB() {
   return new Promise((res, rej) => {
@@ -74,6 +124,37 @@ function dbGetAll(store) {
   }));
 }
 
+function dbGetAllByIndexValue(store, indexName, value) {
+  return openDB().then(d => new Promise((res, rej) => {
+    const req = d.transaction(store,'readonly')
+      .objectStore(store)
+      .index(indexName)
+      .getAll(IDBKeyRange.only(value));
+    req.onsuccess = () => res(req.result || []);
+    req.onerror = () => rej(req.error);
+  }));
+}
+
+function dbGetRecentByIndex(store, indexName, limit = POPUP_RECORD_LIMIT) {
+  return openDB().then(d => new Promise((res, rej) => {
+    const out = [];
+    const req = d.transaction(store,'readonly')
+      .objectStore(store)
+      .index(indexName)
+      .openCursor(null, 'prev');
+    req.onsuccess = e => {
+      const cursor = e.target.result;
+      if (!cursor || out.length >= limit) {
+        res(out);
+        return;
+      }
+      out.push(cursor.value);
+      cursor.continue();
+    };
+    req.onerror = () => rej(req.error);
+  }));
+}
+
 function getRecordTime(item = {}) {
   return Number(item.timestamp || item.endTime || item.startedAt || item.startTime || item.lastVisit || 0);
 }
@@ -105,6 +186,62 @@ async function getFullDataPayload() {
   return { trainer, sessions, videos, battles, site_stats };
 }
 
+function recordIdentity(item = {}) {
+  return item.id !== undefined
+    ? String(item.id)
+    : [item.domain, item.url, item.video_id, item.timestamp, item.startTime, item.endTime].map(value => value || '').join('|');
+}
+
+function mergePopupRecords(todayRecords = [], recentRecords = [], limit = POPUP_RECORD_LIMIT) {
+  const seen = new Set();
+  const merged = [];
+  [...todayRecords, ...recentRecords].forEach(item => {
+    const key = recordIdentity(item);
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(item);
+  });
+
+  const today = new Date().toDateString();
+  const todayItems = merged.filter(item => item.date === today);
+  const olderItems = merged
+    .filter(item => item.date !== today)
+    .sort((a, b) => getRecordTime(b) - getRecordTime(a))
+    .slice(0, Math.max(0, limit - todayItems.length));
+  return [...todayItems, ...olderItems].sort((a, b) => getRecordTime(a) - getRecordTime(b));
+}
+
+async function getPopupDataPayload() {
+  const today = new Date().toDateString();
+  const [
+    trainer,
+    todaySessions,
+    recentSessions,
+    todayVideos,
+    recentVideos,
+    todayBattles,
+    recentBattles,
+    site_stats
+  ] = await Promise.all([
+    getOrCreateTrainer(),
+    dbGetAllByIndexValue('sessions', 'date', today),
+    dbGetRecentByIndex('sessions', 'timestamp', POPUP_RECORD_LIMIT),
+    dbGetAllByIndexValue('videos', 'date', today),
+    dbGetRecentByIndex('videos', 'timestamp', POPUP_RECORD_LIMIT),
+    dbGetAllByIndexValue('battles', 'date', today),
+    dbGetRecentByIndex('battles', 'timestamp', POPUP_RECORD_LIMIT),
+    dbGetRecentByIndex('site_stats', 'lastVisit', POPUP_RECORD_LIMIT)
+  ]);
+
+  return {
+    trainer,
+    sessions: mergePopupRecords(todaySessions, recentSessions).map(sanitizeSessionRecord),
+    videos: mergePopupRecords(todayVideos, recentVideos),
+    battles: mergePopupRecords(todayBattles, recentBattles),
+    site_stats
+  };
+}
+
 function resetDailyTrainerFields(t, today) {
   if (t.lastDate && t.lastDate !== today) {
     t.streak = (t.todayXP || 0) >= 100 ? (t.streak || 0) + 1 : 0;
@@ -112,7 +249,11 @@ function resetDailyTrainerFields(t, today) {
   t.todayXP = 0;
   t.todayFocusMs = 0;
   t.leetcodeTodaySolved = 0;
+  t.leetcodeTodaySolvedSlugs = { date: localDateKey(), slugs: {} };
   t.githubTodayCommits = 0;
+  t.githubTodayContributions = 0;
+  t.lastGitHubTodayCommitsAwarded = 0;
+  t.lastGitHubCommitAwardDate = today;
   t.chatgptTodayCount = 0;
   t.githubRepos = {};
   t.leetcodeProblems = {};
@@ -124,7 +265,7 @@ function resetDailyTrainerFields(t, today) {
     'AI Tools': 0,
     'General': 0
   };
-  t.lastEvoStage = 'pichu';
+  t.lastEvoStage = getCompanionEvolutionForm(t.partnerPokemon || 'pikachu', 0);
   t.lastDate = today;
 }
 
@@ -142,6 +283,7 @@ async function getOrCreateTrainer() {
       onboarded: false,
       partnerPokemon: 'pikachu',
       trackingPaused: false,
+      flowGuardEnabled: true,
       
       // New profile fields
       leetcodeUsername: '',
@@ -151,9 +293,20 @@ async function getOrCreateTrainer() {
       hackerrankUsername: '',
       
       lastLeetCodeSolved: 0,
+      leetcodeStreak: 0,
+      leetcodeTotalActiveDays: 0,
+      leetcodeLastActiveDate: '',
+      leetcodeTodaySolvedSlugs: { date: localDateKey(), slugs: {} },
+      leetcodeSolvedLiveSlugs: {},
       lastGitHubCommits: 0,
       lastGitHubPRs: 0,
       lastGitHubIssues: 0,
+      lastGitHubCommitAwardDate: '',
+      lastGitHubTodayCommitsAwarded: 0,
+      githubContributions: 0,
+      githubTodayContributions: 0,
+      githubContributionStreak: 0,
+      githubLastContributionDate: '',
       
       educationalVideoMinutes: 0,
       entertainmentVideoMinutes: 0,
@@ -168,16 +321,29 @@ async function getOrCreateTrainer() {
     trainerName: 'Trainer',
     onboarded: true,
     partnerPokemon: 'pikachu',
+    lastEvoStage: 'pichu',
     trackingPaused: false,
+    flowGuardEnabled: true,
     leetcodeUsername: '',
     githubUsername: '',
     codeforcesHandle: '',
     codechefHandle: '',
     hackerrankUsername: '',
     lastLeetCodeSolved: 0,
+    leetcodeStreak: 0,
+    leetcodeTotalActiveDays: 0,
+    leetcodeLastActiveDate: '',
+    leetcodeTodaySolvedSlugs: { date: localDateKey(), slugs: {} },
+    leetcodeSolvedLiveSlugs: {},
     lastGitHubCommits: 0,
     lastGitHubPRs: 0,
     lastGitHubIssues: 0,
+    lastGitHubCommitAwardDate: '',
+    lastGitHubTodayCommitsAwarded: 0,
+    githubContributions: 0,
+    githubTodayContributions: 0,
+    githubContributionStreak: 0,
+    githubLastContributionDate: '',
     educationalVideoMinutes: 0,
     entertainmentVideoMinutes: 0,
     lastSyncTime: 0,
@@ -199,6 +365,10 @@ async function getOrCreateTrainer() {
       t[k] = JSON.parse(JSON.stringify(v));
       updated = true;
     }
+  }
+  if (!getCompanionChain(t.partnerPokemon || 'pikachu').includes(t.lastEvoStage)) {
+    t.lastEvoStage = getCompanionEvolutionForm(t.partnerPokemon || 'pikachu', t.todayFocusMs || 0);
+    updated = true;
   }
   if (updated) {
     await dbPut('trainer', t);
@@ -239,21 +409,66 @@ function getSiteInfo(domain) {
   return {type:'General', xpPerMin:0.5, icon:'🌐', domain};
 }
 
-// Evolution based on TODAY's focus hours
-// Pichu: default, Pikachu: 3h+, Raichu: 10h+
+const COMPANION_CHAINS = {
+  pikachu: ['pichu', 'pikachu', 'raichu'],
+  bulbasaur: ['bulbasaur', 'ivysaur', 'venusaur'],
+  charmander: ['charmander', 'charmeleon', 'charizard'],
+  squirtle: ['squirtle', 'wartortle', 'blastoise'],
+  eevee: ['eevee', 'espeon', 'umbreon']
+};
+
+const COMPANION_NAMES = {
+  pichu: 'Pichu',
+  pikachu: 'Pikachu',
+  raichu: 'Raichu',
+  bulbasaur: 'Bulbasaur',
+  ivysaur: 'Ivysaur',
+  venusaur: 'Venusaur',
+  charmander: 'Charmander',
+  charmeleon: 'Charmeleon',
+  charizard: 'Charizard',
+  squirtle: 'Squirtle',
+  wartortle: 'Wartortle',
+  blastoise: 'Blastoise',
+  eevee: 'Eevee',
+  espeon: 'Espeon',
+  umbreon: 'Umbreon'
+};
+
+function getCompanionChain(partner = 'pikachu') {
+  return COMPANION_CHAINS[partner] || COMPANION_CHAINS.pikachu;
+}
+
+function getEvoIndex(todayFocusMs) {
+  const h = (todayFocusMs || 0) / 3600000;
+  if (h >= 10) return 2;
+  if (h >= 3) return 1;
+  return 0;
+}
+
+// Evolution based on TODAY's focus hours.
 function getEvoStage(todayFocusMs) {
-  const h = todayFocusMs / 3600000;
-  if (h >= 10) return 'raichu';
-  if (h >= 3)  return 'pikachu';
-  return 'pichu';
+  return getCompanionChain('pikachu')[getEvoIndex(todayFocusMs)];
+}
+
+function getCompanionEvolutionForm(partner, todayFocusMs) {
+  const chain = getCompanionChain(partner);
+  return chain[getEvoIndex(todayFocusMs)] || chain[0];
+}
+
+function getCompanionName(form) {
+  return COMPANION_NAMES[form] || 'Companion';
 }
 
 // --- Active Time Engine Variables and Helpers ---
 let lastFocusedWindowId = null;
-const HEARTBEAT_SECONDS = 5;
-const HEARTBEAT_SUSPEND_MS = 15000;
+const HEARTBEAT_SECONDS = 2;
+const HEARTBEAT_SUSPEND_MS = 10000;
 const MAX_COUNTED_HEARTBEAT_SECONDS = HEARTBEAT_SUSPEND_MS / 1000;
+const SESSION_WALL_CLOCK_GRACE_MS = HEARTBEAT_SECONDS * 1000;
+const FLOW_GUARD_COOLDOWN_MS = 3 * 60 * 1000;
 let trackingQueue = Promise.resolve();
+let lastFlowGuardWarningAt = 0;
 
 function runTrackingTask(task) {
   const next = trackingQueue.catch(() => {}).then(task);
@@ -278,6 +493,97 @@ function getInitialHeartbeatSeconds(msg, now) {
   return Math.min(HEARTBEAT_SECONDS, activeForSeconds);
 }
 
+function localDayStartMs(timeMs) {
+  const d = new Date(timeMs);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function nextLocalDayStartMs(timeMs) {
+  const d = new Date(timeMs);
+  d.setHours(24, 0, 0, 0);
+  return d.getTime();
+}
+
+function splitCountedDurationByDay(startTime, endTime, countedMs) {
+  const start = Number(startTime) || endTime;
+  const end = Math.max(Number(endTime) || start, start);
+  const total = Math.max(0, Math.round(Number(countedMs) || 0));
+  if (!total) return [];
+
+  const elapsed = Math.max(1, end - start);
+  const slices = [];
+  let cursor = start;
+  let allocated = 0;
+
+  while (cursor < end) {
+    const sliceEnd = Math.min(end, nextLocalDayStartMs(cursor));
+    const isLast = sliceEnd >= end;
+    const durationMs = isLast
+      ? total - allocated
+      : Math.round(total * ((sliceEnd - cursor) / elapsed));
+    if (durationMs > 0) {
+      slices.push({
+        startTime: cursor,
+        endTime: sliceEnd,
+        durationMs,
+        date: new Date(cursor).toDateString()
+      });
+      allocated += durationMs;
+    }
+    cursor = sliceEnd;
+  }
+
+  if (!slices.length) {
+    return [{ startTime: start, endTime: end, durationMs: total, date: new Date(end).toDateString() }];
+  }
+  return slices;
+}
+
+function getSessionWallClockMs(startTime, endTime) {
+  const start = Number(startTime) || 0;
+  const end = Number(endTime) || start;
+  return Math.max(0, end - start);
+}
+
+function clampSessionDurationMs(durationMs, startTime, endTime) {
+  const duration = Math.max(0, Math.round(Number(durationMs) || 0));
+  const wallClockMs = getSessionWallClockMs(startTime, endTime);
+  if (!wallClockMs) return Math.min(duration, SESSION_WALL_CLOCK_GRACE_MS);
+  return Math.min(duration, wallClockMs + SESSION_WALL_CLOCK_GRACE_MS);
+}
+
+function getSessionDurationMs(sess = {}) {
+  return clampSessionDurationMs(
+    Math.round((Number(sess.accumulatedSeconds) || 0) * 1000),
+    sess.startTime,
+    sess.lastHeartbeatTime || sess.endTime || sess.timestamp
+  );
+}
+
+function sanitizeSessionRecord(session = {}) {
+  const durationMs = clampSessionDurationMs(
+    session.durationMs,
+    session.startTime,
+    session.endTime || session.timestamp || session.startTime
+  );
+  if (durationMs === session.durationMs) return session;
+  const info = getSiteInfo(session.domain || '');
+  const xp = session.inProgress
+    ? Math.round((durationMs / 60000) * info.xpPerMin)
+    : Math.min(Number(session.xp) || 0, Math.round((durationMs / 60000) * info.xpPerMin));
+  return { ...session, durationMs, xp };
+}
+
+function getTodayLiveSessionMs(sess) {
+  if (!sess) return 0;
+  const durationMs = getSessionDurationMs(sess);
+  const today = new Date().toDateString();
+  return splitCountedDurationByDay(sess.startTime, sess.lastHeartbeatTime, durationMs)
+    .filter(slice => slice.date === today)
+    .reduce((sum, slice) => sum + slice.durationMs, 0);
+}
+
 function createSessionFromHeartbeat(msg, sender, now, seconds = HEARTBEAT_SECONDS) {
   return {
     domain: msg.domain,
@@ -288,6 +594,69 @@ function createSessionFromHeartbeat(msg, sender, now, seconds = HEARTBEAT_SECOND
     lastHeartbeatTime: now,
     accumulatedSeconds: seconds
   };
+}
+
+function getPathFromUrl(url = '') {
+  try {
+    return new URL(url).pathname.toLowerCase();
+  } catch {
+    return String(url || '').toLowerCase();
+  }
+}
+
+function classifyHeartbeatIntent(msg = {}) {
+  const domain = String(msg.domain || '').replace(/^www\./, '');
+  const path = getPathFromUrl(msg.url || '');
+  const info = getSiteInfo(domain);
+
+  if (domain === 'github.com') {
+    if (path.startsWith('/notifications') || path.startsWith('/trending') || path.startsWith('/explore')) {
+      return { kind: 'interruption', label: 'GitHub browsing' };
+    }
+    return { kind: 'flow', label: 'GitHub work' };
+  }
+
+  if (domain.includes('leetcode.com')) {
+    if (path.includes('/discuss')) return { kind: 'neutral', label: 'LeetCode discuss' };
+    return { kind: 'flow', label: 'LeetCode problem work' };
+  }
+
+  if (domain.includes('youtube.com')) {
+    if (msg.youtube?.isShorts) return { kind: 'interruption', label: 'YouTube Shorts' };
+    if (msg.youtube?.isPlaying && isEdu(msg.youtube?.title || '')) return { kind: 'flow', label: 'YouTube learning' };
+    return { kind: 'interruption', label: 'YouTube' };
+  }
+
+  if (domain.includes('stackoverflow.com') || domain.includes('developer.mozilla.org') || domain.includes('docs.') || domain.includes('readthedocs')) {
+    return { kind: 'flow', label: 'Research' };
+  }
+
+  if (domain.includes('chatgpt.com') || domain.includes('claude.ai')) {
+    return { kind: 'flow', label: 'AI-assisted work' };
+  }
+
+  if (info.type === 'Social' || info.type === 'Entertainment') return { kind: 'interruption', label: domain || info.type };
+  if (['Development', 'Training Ground', 'Research', 'Productivity', 'AI Assistant'].includes(info.type)) {
+    return { kind: 'flow', label: domain || info.type };
+  }
+  return { kind: 'neutral', label: domain || 'this page' };
+}
+
+function maybeWarnFlowSwitch(previousSession, msg, sender, profile, now) {
+  if (!previousSession || profile.flowGuardEnabled === false) return;
+  if (!sender.tab?.id) return;
+  if (now - lastFlowGuardWarningAt < FLOW_GUARD_COOLDOWN_MS) return;
+
+  const previousIntent = classifyHeartbeatIntent(previousSession);
+  const nextIntent = classifyHeartbeatIntent(msg);
+  if (previousIntent.kind !== 'flow' || nextIntent.kind !== 'interruption') return;
+
+  const focusedMinutes = Math.max(1, Math.floor(getSessionDurationMs(previousSession) / 60000));
+  lastFlowGuardWarningAt = now;
+  sendTabMessage(sender.tab.id, {
+    type: 'PIKA_WARN',
+    text: `Flow Guard: you left ${previousIntent.label} after ${focusedMinutes}m for ${nextIntent.label}.`
+  });
 }
 
 // Initialize lastFocusedWindowId
@@ -329,6 +698,8 @@ function cleanString(value, maxLength = 80) {
   return String(value || '').trim().slice(0, maxLength);
 }
 
+const PARTNER_FORMS = new Set(Object.keys(COMPANION_CHAINS));
+
 function sanitizeProfileFields(fields = {}) {
   const allowed = {
     trainerName: value => cleanString(value, 40) || 'Trainer',
@@ -337,8 +708,12 @@ function sanitizeProfileFields(fields = {}) {
     codeforcesHandle: value => cleanString(value, 64),
     codechefHandle: value => cleanString(value, 64),
     hackerrankUsername: value => cleanString(value, 64),
-    partnerPokemon: value => cleanString(value, 24) === 'pikachu' ? 'pikachu' : 'pikachu',
+    partnerPokemon: value => {
+      const partner = cleanString(value, 24).toLowerCase();
+      return PARTNER_FORMS.has(partner) ? partner : 'pikachu';
+    },
     trackingPaused: value => Boolean(value),
+    flowGuardEnabled: value => Boolean(value),
     onboarded: value => Boolean(value)
   };
   return Object.entries(fields).reduce((out, [key, value]) => {
@@ -351,7 +726,75 @@ function resetLeetCodeSyncState(t) {
   t.leetcodeSolved = 0;
   t.leetcodeTodaySolved = 0;
   t.lastLeetCodeSolved = 0;
+  t.leetcodeStreak = 0;
+  t.leetcodeTotalActiveDays = 0;
+  t.leetcodeLastActiveDate = '';
   t.leetcodeProblems = {};
+  t.leetcodeTodaySolvedSlugs = { date: localDateKey(), slugs: {} };
+  t.leetcodeSolvedLiveSlugs = {};
+}
+
+function normalizeLeetCodeSlug(value) {
+  return cleanString(value, 120).toLowerCase().replace(/[^a-z0-9-]/g, '');
+}
+
+function getTodayLeetCodeSolvedSlugs(t) {
+  const today = localDateKey();
+  if (!t.leetcodeTodaySolvedSlugs || t.leetcodeTodaySolvedSlugs.date !== today) {
+    t.leetcodeTodaySolvedSlugs = { date: today, slugs: {} };
+  }
+  t.leetcodeTodaySolvedSlugs.slugs = t.leetcodeTodaySolvedSlugs.slugs || {};
+  return t.leetcodeTodaySolvedSlugs.slugs;
+}
+
+async function recordLiveLeetCodeSolved(msg = {}, sender = {}) {
+  const slug = normalizeLeetCodeSlug(msg.problem || msg.titleSlug);
+  if (!slug) return { ok: false, error: 'Missing LeetCode problem slug' };
+
+  const t = await getOrCreateTrainer();
+  const now = Date.now();
+  const todaySlugs = getTodayLeetCodeSolvedSlugs(t);
+  if (todaySlugs[slug]) {
+    return { ok: true, duplicate: true, problem: slug };
+  }
+
+  todaySlugs[slug] = now;
+  t.leetcodeSolvedLiveSlugs = t.leetcodeSolvedLiveSlugs || {};
+  const isNewLiveSlug = !t.leetcodeSolvedLiveSlugs[slug];
+  t.leetcodeSolvedLiveSlugs[slug] = now;
+
+  t.leetcodeProblems = t.leetcodeProblems || {};
+  if (!t.leetcodeProblems[slug]) {
+    t.leetcodeProblems[slug] = { seconds: 0, lastVisited: now };
+  }
+  t.leetcodeProblems[slug].lastVisited = now;
+
+  t.leetcodeTodaySolved = (Number(t.leetcodeTodaySolved) || 0) + 1;
+  if (isNewLiveSlug) {
+    const solvedBase = Math.max(Number(t.leetcodeSolved) || 0, Number(t.lastLeetCodeSolved) || 0);
+    t.leetcodeSolved = solvedBase + 1;
+    t.lastLeetCodeSolved = Math.max(Number(t.lastLeetCodeSolved) || 0, t.leetcodeSolved);
+  }
+
+  const date = new Date().toDateString();
+  const xp = 50;
+  t.totalXP = (Number(t.totalXP) || 0) + xp;
+  t.todayXP = (Number(t.todayXP) || 0) + xp;
+  t.level = Math.floor((Number(t.totalXP) || 0) / 500) + 1;
+
+  await dbAdd('sessions', { domain: 'leetcode.com', type: 'Training Ground', startTime: now, endTime: now, durationMs: 0, xp, date, url: msg.url || '', timestamp: now });
+  await dbAdd('battles', { domain: 'leetcode.com', durationMs: 0, won: true, xp, date, timestamp: now });
+  await dbPut('trainer', t);
+
+  if (sender?.tab?.id) {
+    sendTabMessage(sender.tab.id, {
+      type: 'PIKA_CELEBRATE',
+      text: `Accepted ${slug.replace(/-/g, ' ')}. +${xp} XP!`,
+      xp
+    });
+  }
+
+  return { ok: true, problem: slug, xp, todaySolved: t.leetcodeTodaySolved, solved: t.leetcodeSolved };
 }
 
 function resetGitHubSyncState(t) {
@@ -360,6 +803,12 @@ function resetGitHubSyncState(t) {
   t.lastGitHubCommits = 0;
   t.lastGitHubPRs = 0;
   t.lastGitHubIssues = 0;
+  t.lastGitHubCommitAwardDate = '';
+  t.lastGitHubTodayCommitsAwarded = 0;
+  t.githubContributions = 0;
+  t.githubTodayContributions = 0;
+  t.githubContributionStreak = 0;
+  t.githubLastContributionDate = '';
   t.githubRepos = {};
 }
 
@@ -393,92 +842,109 @@ async function updateHeartbeatTrainerStats({ category, githubRepo, leetcodeProbl
 }
 
 async function closeCurrentSession() {
-  const data = await chrome.storage.local.get(['currentSession']);
+  const data = await storageGet(['currentSession']);
   if (data.currentSession) {
     const sess = data.currentSession;
-    const durationMs = Math.round((sess.accumulatedSeconds || 0) * 1000);
+    const durationMs = getSessionDurationMs(sess);
     
     // Only log if we accumulated at least 5 seconds
     if (durationMs >= 5000) {
       const info = getSiteInfo(sess.domain);
-      const mins = durationMs / 60000;
-      const xp = Math.round(mins * info.xpPerMin);
-      const date = new Date().toDateString();
+      const slices = splitCountedDurationByDay(sess.startTime, sess.lastHeartbeatTime, durationMs);
+      const today = new Date().toDateString();
+      let totalXp = 0;
+      let todayFocusMs = 0;
 
-      // Log session
-      await dbAdd('sessions', {
-        domain: sess.domain,
-        url: sess.url || '',
-        tabId: sess.tabId,
-        windowId: sess.windowId,
-        type: info.type,
-        startTime: sess.startTime,
-        endTime: sess.lastHeartbeatTime,
-        durationMs,
-        xp,
-        date,
-        timestamp: sess.lastHeartbeatTime
-      });
+      for (const slice of slices) {
+        if (slice.durationMs < 1000) continue;
+        const mins = slice.durationMs / 60000;
+        const xp = Math.round(mins * info.xpPerMin);
+        totalXp += xp;
+        if (slice.date === today) todayFocusMs += slice.durationMs;
+
+        await dbAdd('sessions', {
+          domain: sess.domain,
+          url: sess.url || '',
+          tabId: sess.tabId,
+          windowId: sess.windowId,
+          type: info.type,
+          startTime: slice.startTime,
+          endTime: slice.endTime,
+          durationMs: slice.durationMs,
+          xp,
+          date: slice.date,
+          timestamp: slice.endTime
+        });
+      }
 
       // Update trainer focus time & XP
       const t = await getOrCreateTrainer();
-      t.totalXP += xp;
-      t.todayXP += xp;
+      t.totalXP += totalXp;
+      t.todayXP += slices
+        .filter(slice => slice.date === today)
+        .reduce((sum, slice) => sum + Math.round((slice.durationMs / 60000) * info.xpPerMin), 0);
       t.totalFocusMs = (t.totalFocusMs || 0) + durationMs;
-      t.todayFocusMs = (t.todayFocusMs || 0) + durationMs;
+      t.todayFocusMs = (t.todayFocusMs || 0) + todayFocusMs;
       t.level = Math.floor(t.totalXP / 500) + 1;
 
-      // Handle evolution
-      const newEvo = getEvoStage(t.todayFocusMs);
-      if (newEvo !== (t.lastEvoStage || 'pichu')) {
+      // Handle evolution only when today's focus crosses the 3h or 10h threshold.
+      const previousTodayFocusMs = Math.max(0, (t.todayFocusMs || 0) - todayFocusMs);
+      const previousEvoIndex = getEvoIndex(previousTodayFocusMs);
+      const newEvoIndex = getEvoIndex(t.todayFocusMs || 0);
+      const previousEvo = getCompanionEvolutionForm(t.partnerPokemon || 'pikachu', previousTodayFocusMs);
+      const newEvo = getCompanionEvolutionForm(t.partnerPokemon || 'pikachu', t.todayFocusMs || 0);
+      if (newEvoIndex > previousEvoIndex && newEvo !== previousEvo) {
         t.lastEvoStage = newEvo;
         chrome.tabs.query({ active: true }, tabs => {
           tabs.forEach(tab => {
-            chrome.tabs.sendMessage(tab.id, {
+            sendTabMessage(tab.id, {
               type: 'PIKA_EVOLVE',
               stage: newEvo,
-              text: newEvo === 'pikachu' ? '3 hours of focus. Pikachu powered up!' : '10 hours of focus. Pikachu is fully charged!'
-            }).catch(() => {});
+              partner: t.partnerPokemon || 'pikachu',
+              text: `${getCompanionName(newEvo)} evolved after ${newEvoIndex === 1 ? '3' : '10'} hours of focus!`
+            });
           });
         });
+      } else {
+        t.lastEvoStage = newEvo;
       }
       await dbPut('trainer', t);
 
       // Log battle if >= 2 minutes (120,000ms)
-      if (durationMs >= 120000) {
+      for (const slice of slices.filter(item => item.durationMs >= 120000)) {
         let won = true;
-        let battleXp = xp;
+        let battleXp = Math.round((slice.durationMs / 60000) * info.xpPerMin);
 
         if (info.type === 'Social') {
           won = false;
           battleXp = 0;
         } else if (info.type === 'Entertainment') {
           const vids = await dbGetAll('videos');
-          const sessionVids = vids.filter(v => v.timestamp >= sess.startTime && v.timestamp <= sess.lastHeartbeatTime);
+          const sessionVids = vids.filter(v => v.timestamp >= slice.startTime && v.timestamp <= slice.endTime);
           const hasEdu = sessionVids.some(v => v.educational);
           if (hasEdu) {
             won = true;
           } else {
             won = false;
-            battleXp = Math.round(xp * 0.2);
+            battleXp = Math.round(battleXp * 0.2);
           }
         }
         await dbAdd('battles', {
           domain: sess.domain,
-          durationMs,
+          durationMs: slice.durationMs,
           won,
           xp: battleXp,
-          date,
-          timestamp: Date.now()
+          date: slice.date,
+          timestamp: slice.endTime
         });
       }
     }
-    await chrome.storage.local.remove(['currentSession']);
+    await storageRemove(['currentSession']);
   }
 }
 
 async function closeCurrentVideo() {
-  const data = await chrome.storage.local.get(['currentVideo']);
+  const data = await storageGet(['currentVideo']);
   if (data.currentVideo) {
     const v = data.currentVideo;
     if (v.watchSeconds >= 5) {
@@ -531,7 +997,7 @@ async function closeCurrentVideo() {
       t.level = Math.floor(t.totalXP / 500) + 1;
       await dbPut('trainer', t);
     }
-    await chrome.storage.local.remove(['currentVideo']);
+    await storageRemove(['currentVideo']);
   }
 }
 
@@ -603,7 +1069,7 @@ async function handleHeartbeat(msg, sender) {
   }
 
   const isValid = msg.visible && msg.userActive;
-  const storage = await chrome.storage.local.get(['currentSession', 'currentVideo']);
+  const storage = await storageGet(['currentSession', 'currentVideo']);
   let sess = storage.currentSession;
   let vid = storage.currentVideo;
   const now = Date.now();
@@ -620,8 +1086,15 @@ async function handleHeartbeat(msg, sender) {
         heartbeatSeconds = getHeartbeatSeconds(sess.lastHeartbeatTime, now);
         sess.lastHeartbeatTime = now;
         sess.accumulatedSeconds = (sess.accumulatedSeconds || 0) + heartbeatSeconds;
+        const cappedSeconds = Math.floor(getSessionDurationMs(sess) / 1000);
+        if (cappedSeconds < sess.accumulatedSeconds) {
+          sess.accumulatedSeconds = cappedSeconds;
+        }
         sess.url = msg.url;
       } else {
+        if (!isSuspended) {
+          maybeWarnFlowSwitch(sess, msg, sender, profile, now);
+        }
         await closeCurrentSession();
         heartbeatSeconds = getInitialHeartbeatSeconds(msg, now);
         sess = createSessionFromHeartbeat(msg, sender, now, heartbeatSeconds);
@@ -720,22 +1193,36 @@ async function handleHeartbeat(msg, sender) {
   if (sess) {
     toSet.currentSession = sess;
   } else {
-    await chrome.storage.local.remove(['currentSession']);
+    await storageRemove(['currentSession']);
   }
   if (vid) {
     toSet.currentVideo = vid;
   } else {
-    await chrome.storage.local.remove(['currentVideo']);
+    await storageRemove(['currentVideo']);
   }
   
   if (Object.keys(toSet).length > 0) {
-    await chrome.storage.local.set(toSet);
+    await storageSet(toSet);
   }
 }
 
 // Proactive listeners to end sessions immediately on tab/window changes
 chrome.tabs.onActivated.addListener(async ({tabId}) => {
   await runTrackingTask(async () => {
+    const [storage, profile, tab] = await Promise.all([
+      storageGet(['currentSession']),
+      getOrCreateTrainer(),
+      tabsGet(tabId)
+    ]);
+    if (storage.currentSession && tab?.url) {
+      maybeWarnFlowSwitch(
+        storage.currentSession,
+        { domain: getDomain(tab.url) || '', url: tab.url },
+        { tab },
+        profile,
+        Date.now()
+      );
+    }
     await closeCurrentSession();
     await closeCurrentVideo();
   });
@@ -743,6 +1230,19 @@ chrome.tabs.onActivated.addListener(async ({tabId}) => {
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status==='complete' && tab.active) {
     await runTrackingTask(async () => {
+      const [storage, profile] = await Promise.all([
+        storageGet(['currentSession']),
+        getOrCreateTrainer()
+      ]);
+      if (storage.currentSession && tab?.url) {
+        maybeWarnFlowSwitch(
+          storage.currentSession,
+          { domain: getDomain(tab.url) || '', url: tab.url },
+          { tab },
+          profile,
+          Date.now()
+        );
+      }
       await closeCurrentSession();
       await closeCurrentVideo();
     });
@@ -787,23 +1287,131 @@ async function fetchJsonWithTimeout(url, options = {}, label = 'Request', timeou
   }
 }
 
-async function fetchCachedAccountStats(provider, username, fetcher) {
+async function fetchTextWithTimeout(url, options = {}, label = 'Request', timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (!res.ok) throw new Error(`${label} returned HTTP ${res.status}`);
+    return await res.text();
+  } catch (error) {
+    if (error.name === 'AbortError') throw error;
+    if (error instanceof TypeError) {
+      throw new Error(`${label} could not connect. Check network access or API availability.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function localDateKey(date = new Date()) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function shiftDateKey(dateKey, deltaDays) {
+  const date = new Date(`${dateKey}T12:00:00`);
+  date.setDate(date.getDate() + deltaDays);
+  return localDateKey(date);
+}
+
+function computeContributionStreak(days, todayKey = localDateKey()) {
+  if (!days || !Object.keys(days).length) return 0;
+
+  let cursor = todayKey;
+  if (!(days[cursor] > 0)) {
+    const yesterday = shiftDateKey(todayKey, -1);
+    if (days[yesterday] > 0) {
+      cursor = yesterday;
+    } else {
+      return 0;
+    }
+  }
+
+  let streak = 0;
+  while (days[cursor] > 0) {
+    streak++;
+    cursor = shiftDateKey(cursor, -1);
+  }
+  return streak;
+}
+
+async function fetchCachedAccountStats(provider, username, fetcher, options = {}) {
   const safeName = cleanString(username, 80).toLowerCase();
   const key = `syncCache:${provider}:${safeName}`;
-  const cached = (await chrome.storage.local.get(key))[key];
+  const cached = (await storageGet(key))[key];
   const now = Date.now();
-  if (cached?.data && now - cached.at < SYNC_CACHE_TTL_MS) {
+  const ttl = Number(options.ttlMs || SYNC_CACHE_TTL_MS);
+  if (!options.force && cached?.data && now - cached.at < ttl) {
     return { ...cached.data, fromCache: true };
   }
 
   const data = await fetcher();
-  await chrome.storage.local.set({ [key]: { at: now, data } });
+  await storageSet({ [key]: { at: now, data } });
   return { ...data, fromCache: false };
+}
+
+function parseLeetCodeCalendar(calendarJson) {
+  try {
+    const raw = JSON.parse(calendarJson || '{}');
+    const days = {};
+    Object.entries(raw).forEach(([timestamp, count]) => {
+      const seconds = Number(timestamp);
+      const value = Number(count) || 0;
+      if (!Number.isFinite(seconds) || value <= 0) return;
+      const key = localDateKey(new Date(seconds * 1000));
+      days[key] = (days[key] || 0) + value;
+    });
+    return days;
+  } catch {
+    return {};
+  }
+}
+
+async function fetchLeetCodeCalendarStats(username) {
+  const year = new Date().getFullYear();
+  const query = `
+    query userProfileCalendar($username: String!, $year: Int) {
+      matchedUser(username: $username) {
+        userCalendar(year: $year) {
+          streak
+          totalActiveDays
+          submissionCalendar
+        }
+      }
+    }
+  `;
+  const json = await fetchJsonWithTimeout('https://leetcode.com/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, variables: { username, year } })
+  }, 'LeetCode calendar');
+  const calendar = json?.data?.matchedUser?.userCalendar;
+  if (!calendar) throw new Error('LeetCode calendar response did not include profile calendar');
+
+  const days = parseLeetCodeCalendar(calendar.submissionCalendar);
+  const lastActiveDate = Object.keys(days).sort().pop() || '';
+
+  return {
+    streak: Number(calendar.streak) || computeContributionStreak(days),
+    totalActiveDays: Number(calendar.totalActiveDays) || Object.keys(days).length,
+    lastActiveDate
+  };
 }
 
 async function fetchLeetCodeStats(username) {
   const safeUsername = encodeURIComponent(username);
   const failures = [];
+  let calendarStats = null;
+  try {
+    calendarStats = await fetchLeetCodeCalendarStats(username);
+  } catch (err) {
+    console.warn('PikaDex: LeetCode calendar sync skipped:', describeSyncError(err));
+  }
+
   try {
     const query = `
       query userProblemsSolved($username: String!) {
@@ -845,7 +1453,7 @@ async function fetchLeetCodeStats(username) {
       const easy = stats.find(s => s.difficulty === 'Easy')?.count || 0;
       const medium = stats.find(s => s.difficulty === 'Medium')?.count || 0;
       const hard = stats.find(s => s.difficulty === 'Hard')?.count || 0;
-      return { all, easy, medium, hard, solvedToday };
+      return { all, easy, medium, hard, solvedToday, ...calendarStats };
     }
     throw new Error('LeetCode GraphQL response did not include profile stats');
   } catch (err) {
@@ -875,11 +1483,100 @@ async function fetchLeetCodeStats(username) {
     const easy = stats.find(s => s.difficulty === 'Easy')?.count || 0;
     const medium = stats.find(s => s.difficulty === 'Medium')?.count || 0;
     const hard = stats.find(s => s.difficulty === 'Hard')?.count || 0;
-    return { all, easy, medium, hard, solvedToday };
+    return { all, easy, medium, hard, solvedToday, ...calendarStats };
   } catch (err) {
     failures.push(describeSyncError(err));
     throw new Error(`LeetCode sync unavailable: ${failures.join(' | ')}`);
   }
+}
+
+async function fetchGitHubPublicEventStats(username, isLocalToday) {
+  const safeUsername = encodeURIComponent(username);
+  const events = await fetchJsonWithTimeout(`https://api.github.com/users/${safeUsername}/events/public?per_page=100`, {
+    headers: GITHUB_API_HEADERS
+  }, 'GitHub public events');
+  const commitShas = new Set();
+  let fallbackCommitCount = 0;
+  let contributionsToday = 0;
+
+  (events || []).forEach(event => {
+    if (!isLocalToday(event.created_at)) return;
+    const action = event.payload?.action;
+
+    if (event.type === 'PushEvent') {
+      const commits = event.payload?.commits || [];
+      if (commits.length) {
+        commits.forEach((commit, index) => {
+          commitShas.add(commit.sha || `${event.id}:${index}`);
+        });
+      } else {
+        fallbackCommitCount += Number(event.payload?.distinct_size || event.payload?.size || 0);
+      }
+      contributionsToday += Math.max(1, commits.length || Number(event.payload?.distinct_size || event.payload?.size || 0));
+      return;
+    }
+
+    if (event.type === 'IssuesEvent' && action === 'opened') contributionsToday++;
+    if (event.type === 'PullRequestEvent' && action === 'opened') contributionsToday++;
+    if (event.type === 'PullRequestReviewEvent' && action === 'submitted') contributionsToday++;
+    if (event.type === 'CreateEvent') contributionsToday++;
+  });
+
+  return {
+    commitsToday: commitShas.size + fallbackCommitCount,
+    contributionsToday
+  };
+}
+
+async function fetchGitHubLiveStats(username) {
+  const todayDate = new Date().toDateString();
+  const isLocalToday = dateStr => {
+    const parsed = new Date(dateStr);
+    return !Number.isNaN(parsed.getTime()) && parsed.toDateString() === todayDate;
+  };
+  return fetchGitHubPublicEventStats(username, isLocalToday);
+}
+
+async function fetchGitHubContributionStats(username, todayKey = localDateKey()) {
+  const safeUsername = encodeURIComponent(username);
+  const html = await fetchTextWithTimeout(`https://github.com/users/${safeUsername}/contributions`, {
+    headers: { 'Accept': 'text/html' }
+  }, 'GitHub contribution calendar');
+  const days = {};
+  const dayPattern = /data-date="(\d{4}-\d{2}-\d{2})"[\s\S]*?<tool-tip[^>]*>([\s\S]*?)<\/tool-tip>/g;
+  let match;
+
+  while ((match = dayPattern.exec(html)) !== null) {
+    const [, dateKey, rawTooltip] = match;
+    const text = rawTooltip.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const countMatch = text.match(/([\d,]+)\s+contribution/i);
+    days[dateKey] = countMatch ? Number(countMatch[1].replace(/,/g, '')) : 0;
+  }
+
+  if (!Object.keys(days).length) {
+    throw new Error('GitHub contribution calendar did not include day cells');
+  }
+
+  const totalFromHeader = (() => {
+    const headerMatch = html.match(/id="js-contribution-activity-description"[\s\S]*?>([\s\S]*?)<\/h2>/i);
+    const text = (headerMatch?.[1] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const countMatch = text.match(/([\d,]+)\s+contribution/i);
+    return countMatch ? Number(countMatch[1].replace(/,/g, '')) : null;
+  })();
+  const totalFromDays = Object.values(days).reduce((sum, count) => sum + count, 0);
+  const lastContributionDate = Object.entries(days)
+    .filter(([, count]) => count > 0)
+    .map(([dateKey]) => dateKey)
+    .sort()
+    .pop() || '';
+
+  return {
+    contributions: totalFromHeader ?? totalFromDays,
+    contributionsToday: days[todayKey] || 0,
+    contributionStreak: computeContributionStreak(days, todayKey),
+    lastContributionDate,
+    contributionDays: days
+  };
 }
 
 async function fetchGitHubStats(username) {
@@ -893,10 +1590,14 @@ async function fetchGitHubStats(username) {
   let prs = null;
   let issues = null;
   let repos = null;
-  
-  let commitsToday = null;
+  let commitsToday = 0;
   let prsToday = null;
   let issuesToday = null;
+  let contributions = null;
+  let contributionsToday = 0;
+  let contributionStreak = 0;
+  let lastContributionDate = '';
+  const todayKey = localDateKey();
 
   const todayDate = new Date().toDateString();
   const isLocalToday = dateStr => {
@@ -904,30 +1605,61 @@ async function fetchGitHubStats(username) {
     return !Number.isNaN(parsed.getTime()) && parsed.toDateString() === todayDate;
   };
 
-  // 1. Commits Total & Today
   try {
     const commitData = await fetchJsonWithTimeout(`https://api.github.com/search/commits?q=${safeUserQuery}&sort=author-date&order=desc&per_page=100`, {
-      headers: { 'Accept': 'application/vnd.github.cloak-preview+json' }
+      headers: GITHUB_API_HEADERS
     }, 'GitHub commits');
     successes++;
     commits = commitData.total_count || 0;
-    
-    const items = commitData.items || [];
-    commitsToday = items.filter(item => {
-      const dateStr = item.commit?.author?.date;
-      return dateStr && isLocalToday(dateStr);
-    }).length;
+
+    const todayCommitShas = new Set();
+    (commitData.items || []).forEach(item => {
+      const dateStr = item.commit?.author?.date || item.commit?.committer?.date;
+      if (dateStr && isLocalToday(dateStr)) {
+        todayCommitShas.add(item.sha || item.html_url || dateStr);
+      }
+    });
+    commitsToday = Math.max(commitsToday, todayCommitShas.size);
   } catch (e) {
     failures.push('commits: ' + describeSyncError(e));
     console.warn('PikaDex: GitHub commits sync skipped:', describeSyncError(e));
   }
 
-  // 2. PRs Total & Today
   try {
-    const prData = await fetchJsonWithTimeout(`https://api.github.com/search/issues?q=${safePrQuery}&sort=created&order=desc&per_page=100`, {}, 'GitHub pull requests');
+    const eventStats = await fetchGitHubPublicEventStats(username, isLocalToday);
+    successes++;
+    commitsToday = Math.max(commitsToday, eventStats.commitsToday);
+    contributionsToday = Math.max(contributionsToday, eventStats.contributionsToday);
+  } catch (e) {
+    failures.push('events: ' + describeSyncError(e));
+    console.warn('PikaDex: GitHub event sync skipped:', describeSyncError(e));
+  }
+
+  try {
+    const contributionStats = await fetchGitHubContributionStats(username, todayKey);
+    successes++;
+    contributions = contributionStats.contributions;
+    contributionsToday = Math.max(contributionsToday, contributionStats.contributionsToday, commitsToday);
+    contributionStreak = contributionStats.contributionStreak;
+    lastContributionDate = contributionStats.lastContributionDate;
+
+    if (commitsToday > 0) {
+      contributionStats.contributionDays[todayKey] = Math.max(contributionStats.contributionDays[todayKey] || 0, commitsToday);
+      contributionStreak = computeContributionStreak(contributionStats.contributionDays, todayKey);
+      lastContributionDate = todayKey;
+    }
+  } catch (e) {
+    failures.push('contributions: ' + describeSyncError(e));
+    console.warn('PikaDex: GitHub contribution calendar sync skipped:', describeSyncError(e));
+  }
+
+  try {
+    const prData = await fetchJsonWithTimeout(`https://api.github.com/search/issues?q=${safePrQuery}&sort=created&order=desc&per_page=100`, {
+      headers: GITHUB_API_HEADERS
+    }, 'GitHub pull requests');
     successes++;
     prs = prData.total_count || 0;
-    
+
     const items = prData.items || [];
     prsToday = items.filter(item => {
       const dateStr = item.created_at;
@@ -938,12 +1670,13 @@ async function fetchGitHubStats(username) {
     console.warn('PikaDex: GitHub PR sync skipped:', describeSyncError(e));
   }
 
-  // 3. Issues Total & Today
   try {
-    const issueData = await fetchJsonWithTimeout(`https://api.github.com/search/issues?q=${safeIssueQuery}&sort=created&order=desc&per_page=100`, {}, 'GitHub issues');
+    const issueData = await fetchJsonWithTimeout(`https://api.github.com/search/issues?q=${safeIssueQuery}&sort=created&order=desc&per_page=100`, {
+      headers: GITHUB_API_HEADERS
+    }, 'GitHub issues');
     successes++;
     issues = issueData.total_count || 0;
-    
+
     const items = issueData.items || [];
     issuesToday = items.filter(item => {
       const dateStr = item.created_at;
@@ -954,9 +1687,10 @@ async function fetchGitHubStats(username) {
     console.warn('PikaDex: GitHub issue sync skipped:', describeSyncError(e));
   }
 
-  // 4. Public Repos
   try {
-    const repoData = await fetchJsonWithTimeout(`https://api.github.com/users/${safeUsername}`, {}, 'GitHub user profile');
+    const repoData = await fetchJsonWithTimeout(`https://api.github.com/users/${safeUsername}`, {
+      headers: GITHUB_API_HEADERS
+    }, 'GitHub user profile');
     successes++;
     repos = repoData.public_repos || 0;
   } catch (e) {
@@ -968,52 +1702,70 @@ async function fetchGitHubStats(username) {
     throw new Error(`GitHub sync unavailable: ${failures.join(' | ')}`);
   }
 
-  return { commits, prs, issues, repos, commitsToday, prsToday, issuesToday };
+  return {
+    commits,
+    prs,
+    issues,
+    repos,
+    commitsToday,
+    prsToday,
+    issuesToday,
+    contributions,
+    contributionsToday,
+    contributionStreak,
+    lastContributionDate
+  };
 }
 
-async function syncAccounts() {
+async function syncAccounts(options = {}) {
   const t = await getOrCreateTrainer();
   let xpEarned = 0;
   let logEvents = [];
   let syncErrors = [];
   let cachedProviders = [];
   const date = new Date().toDateString();
+  const todayKey = localDateKey();
 
   // 1. Sync LeetCode
   if (t.leetcodeUsername) {
     try {
-      const stats = await fetchCachedAccountStats('leetcode', t.leetcodeUsername, () => fetchLeetCodeStats(t.leetcodeUsername));
+      const stats = await fetchCachedAccountStats('leetcode', t.leetcodeUsername, () => fetchLeetCodeStats(t.leetcodeUsername), { force: Boolean(options.force) });
       if (stats.fromCache) cachedProviders.push('LeetCode');
       const prevSolved = t.lastLeetCodeSolved || t.leetcodeSolved || 0;
+      const previousTodaySolved = Number(t.leetcodeTodaySolved) || 0;
+      const remoteSolvedToday = Number(stats.solvedToday) || 0;
+      const remoteSolvedAll = Number(stats.all) || 0;
       
       // Set baseline if first sync
       if (prevSolved === 0 && (t.lastLeetCodeSolved === undefined || t.lastLeetCodeSolved === 0)) {
-        t.lastLeetCodeSolved = stats.all;
-        t.leetcodeSolved = stats.all;
-        t.leetcodeTodaySolved = stats.solvedToday;
+        t.lastLeetCodeSolved = remoteSolvedAll;
+        t.leetcodeSolved = Math.max(Number(t.leetcodeSolved) || 0, remoteSolvedAll);
+        t.leetcodeTodaySolved = Math.max(previousTodaySolved, remoteSolvedToday);
 
         // Award XP for today's solves on first connection
-        if (stats.solvedToday > 0) {
-          const xp = stats.solvedToday * 50;
+        const newTodaySolves = Math.max(0, remoteSolvedToday - previousTodaySolved);
+        if (newTodaySolves > 0) {
+          const xp = newTodaySolves * 50;
           t.totalXP += xp;
           t.todayXP += xp;
-          for (let i = 0; i < stats.solvedToday; i++) {
+          for (let i = 0; i < newTodaySolves; i++) {
             await dbAdd('sessions', {domain: 'leetcode.com', type: 'Training Ground', startTime: Date.now(), endTime: Date.now(), durationMs: 0, xp: 50, date});
             await dbAdd('battles', {domain: 'leetcode.com', durationMs: 0, won: true, xp: 50, date, timestamp: Date.now()});
           }
           xpEarned += xp;
-          logEvents.push(`Connected LeetCode: +${stats.solvedToday} Solves Today (+${xp} XP)`);
+          logEvents.push(`Connected LeetCode: +${newTodaySolves} Solves Today (+${xp} XP)`);
         }
       } else {
         // Sync today count directly from LeetCode
-        t.leetcodeTodaySolved = stats.solvedToday;
+        t.leetcodeTodaySolved = Math.max(previousTodaySolved, remoteSolvedToday);
+        t.leetcodeSolved = Math.max(Number(t.leetcodeSolved) || 0, remoteSolvedAll);
 
-        if (stats.all > prevSolved) {
-          const diff = stats.all - prevSolved;
+        if (remoteSolvedAll > prevSolved) {
+          const diff = remoteSolvedAll - prevSolved;
           const xp = diff * 50;
           t.totalXP += xp;
           t.todayXP += xp;
-          t.leetcodeSolved = stats.all;
+          t.leetcodeSolved = Math.max(t.leetcodeSolved, remoteSolvedAll);
 
           // Log events in history
           for (let i = 0; i < diff; i++) {
@@ -1024,7 +1776,10 @@ async function syncAccounts() {
           logEvents.push(`+${diff} LeetCode Solves (+${xp} XP)`);
         }
       }
-      t.lastLeetCodeSolved = stats.all;
+      if (stats.streak !== undefined) t.leetcodeStreak = Math.max(0, Number(stats.streak) || 0);
+      if (stats.totalActiveDays !== undefined) t.leetcodeTotalActiveDays = Math.max(0, Number(stats.totalActiveDays) || 0);
+      if (stats.lastActiveDate !== undefined) t.leetcodeLastActiveDate = stats.lastActiveDate || '';
+      t.lastLeetCodeSolved = Math.max(Number(t.lastLeetCodeSolved) || 0, remoteSolvedAll, Number(t.leetcodeSolved) || 0);
     } catch (e) {
       syncErrors.push('LeetCode: ' + describeSyncError(e));
       console.warn('PikaDex: LeetCode account sync skipped:', describeSyncError(e));
@@ -1034,51 +1789,40 @@ async function syncAccounts() {
   // 2. Sync GitHub
   if (t.githubUsername) {
     try {
-      const stats = await fetchCachedAccountStats('github', t.githubUsername, () => fetchGitHubStats(t.githubUsername));
+      const stats = await fetchCachedAccountStats('github', t.githubUsername, () => fetchGitHubStats(t.githubUsername), { force: Boolean(options.force) });
       if (stats.fromCache) cachedProviders.push('GitHub');
-      const prevCommits = t.lastGitHubCommits || t.githubCommits || 0;
       const prevPRs = t.lastGitHubPRs || 0;
       const prevIssues = t.lastGitHubIssues || 0;
 
-      // Commits
-      if (stats.commits !== null && stats.commitsToday !== null) {
-        if (prevCommits === 0 && (t.lastGitHubCommits === undefined || t.lastGitHubCommits === 0)) {
-          t.lastGitHubCommits = stats.commits;
-          t.githubCommits = stats.commits;
-          t.githubTodayCommits = stats.commitsToday;
-
-          // Award XP for today's commits on first connection
-          if (stats.commitsToday > 0) {
-            const xp = stats.commitsToday * 30;
-            t.totalXP += xp;
-            t.todayXP += xp;
-            for (let i = 0; i < stats.commitsToday; i++) {
-              await dbAdd('sessions', {domain: 'github.com', type: 'Development', startTime: Date.now(), endTime: Date.now(), durationMs: 0, xp: 30, date});
-              await dbAdd('battles', {domain: 'github.com', durationMs: 0, won: true, xp: 30, date, timestamp: Date.now()});
-            }
-            xpEarned += xp;
-            logEvents.push(`Connected GitHub: +${stats.commitsToday} Commits Today (+${xp} XP)`);
-          }
-        } else {
-          // Sync today commits directly
-          t.githubTodayCommits = stats.commitsToday;
-
-          if (stats.commits > prevCommits) {
-            const diff = stats.commits - prevCommits;
-            const xp = diff * 30;
-            t.totalXP += xp;
-            t.todayXP += xp;
-            t.githubCommits = stats.commits;
-
-            for (let i = 0; i < diff; i++) {
-              await dbAdd('sessions', {domain: 'github.com', type: 'Development', startTime: Date.now(), endTime: Date.now(), durationMs: 0, xp: 30, date});
-              await dbAdd('battles', {domain: 'github.com', durationMs: 0, won: true, xp: 30, date, timestamp: Date.now()});
-            }
-            xpEarned += xp;
-            logEvents.push(`+${diff} GitHub Commits (+${xp} XP)`);
-          }
-        }
+      if (stats.commits !== null && stats.commits !== undefined) {
+        t.githubCommits = stats.commits;
       }
+      if (stats.contributions !== null && stats.contributions !== undefined) {
+        t.githubContributions = stats.contributions;
+      }
+      t.githubTodayCommits = Math.max(0, Number(stats.commitsToday || 0));
+      t.githubTodayContributions = Math.max(0, Number(stats.contributionsToday || 0));
+      t.githubContributionStreak = Math.max(0, Number(stats.contributionStreak || 0));
+      t.githubLastContributionDate = stats.lastContributionDate || t.githubLastContributionDate || '';
+
+      if (t.lastGitHubCommitAwardDate !== todayKey) {
+        t.lastGitHubCommitAwardDate = todayKey;
+        t.lastGitHubTodayCommitsAwarded = 0;
+      }
+
+      const commitDelta = Math.max(0, t.githubTodayCommits - (t.lastGitHubTodayCommitsAwarded || 0));
+      if (commitDelta > 0) {
+        const xp = commitDelta * 30;
+        t.totalXP += xp;
+        t.todayXP += xp;
+        for (let i = 0; i < commitDelta; i++) {
+          await dbAdd('sessions', {domain: 'github.com', type: 'Development', startTime: Date.now(), endTime: Date.now(), durationMs: 0, xp: 30, date});
+          await dbAdd('battles', {domain: 'github.com', durationMs: 0, won: true, xp: 30, date, timestamp: Date.now()});
+        }
+        xpEarned += xp;
+        logEvents.push(`+${commitDelta} GitHub commit${commitDelta !== 1 ? 's' : ''} today (+${xp} XP)`);
+      }
+      t.lastGitHubTodayCommitsAwarded = Math.max(t.lastGitHubTodayCommitsAwarded || 0, t.githubTodayCommits);
 
       // PRs (subsequent / first sync)
       if (stats.prs !== null && stats.prsToday !== null) {
@@ -1142,7 +1886,7 @@ async function syncAccounts() {
         }
       }
 
-      if (stats.commits !== null) t.lastGitHubCommits = stats.commits;
+      if (stats.commits !== null && stats.commits !== undefined) t.lastGitHubCommits = stats.commits;
       if (stats.prs !== null) t.lastGitHubPRs = stats.prs;
       if (stats.issues !== null) t.lastGitHubIssues = stats.issues;
     } catch (e) {
@@ -1158,45 +1902,145 @@ async function syncAccounts() {
   return { success: true, xpEarned, logEvents, syncErrors, cachedProviders, lastSyncTime: t.lastSyncTime };
 }
 
+let accountSyncPromise = null;
+let lastAccountSyncAttemptAt = 0;
+
+function queueAccountSync(options = {}) {
+  const now = Date.now();
+  const ttl = Number(options.ttlMs || ACCOUNT_LIVE_SYNC_TTL_MS);
+  if (!options.force && now - lastAccountSyncAttemptAt < ttl) {
+    return accountSyncPromise || Promise.resolve({ success: true, skipped: true });
+  }
+  if (accountSyncPromise && !options.force) return accountSyncPromise;
+
+  lastAccountSyncAttemptAt = now;
+  accountSyncPromise = syncAccounts({ force: Boolean(options.force) })
+    .catch(error => {
+      console.warn('PikaDex: account sync skipped:', describeSyncError(error));
+      return { success: false, error: describeSyncError(error) };
+    })
+    .finally(() => {
+      accountSyncPromise = null;
+    });
+  return accountSyncPromise;
+}
+
+async function refreshLiveGitHub(options = {}) {
+  const initialTrainer = await getOrCreateTrainer();
+  const githubUsername = initialTrainer.githubUsername;
+  if (!githubUsername) return { success: true, skipped: true };
+
+  const stats = await fetchCachedAccountStats(
+    'github-live',
+    githubUsername,
+    () => fetchGitHubLiveStats(githubUsername),
+    { force: Boolean(options.force), ttlMs: Number(options.ttlMs || GITHUB_LIVE_CACHE_TTL_MS) }
+  );
+  const t = await getOrCreateTrainer();
+  if (t.githubUsername !== githubUsername) return { success: true, skipped: true };
+  const todayKey = localDateKey();
+  const date = new Date().toDateString();
+  let xpEarned = 0;
+  let logEvents = [];
+
+  if (t.lastGitHubCommitAwardDate !== todayKey) {
+    t.lastGitHubCommitAwardDate = todayKey;
+    t.lastGitHubTodayCommitsAwarded = 0;
+  }
+
+  const liveCommits = Math.max(0, Number(stats.commitsToday || 0));
+  const liveContributions = Math.max(0, Number(stats.contributionsToday || 0), liveCommits);
+  t.githubTodayCommits = Math.max(Number(t.githubTodayCommits || 0), liveCommits);
+  t.githubTodayContributions = Math.max(Number(t.githubTodayContributions || 0), liveContributions);
+
+  if (t.githubTodayContributions > 0) {
+    t.githubLastContributionDate = todayKey;
+    t.githubContributionStreak = Math.max(1, Number(t.githubContributionStreak || 0));
+  }
+
+  const commitDelta = Math.max(0, t.githubTodayCommits - (t.lastGitHubTodayCommitsAwarded || 0));
+  if (commitDelta > 0) {
+    const xp = commitDelta * 30;
+    t.totalXP += xp;
+    t.todayXP += xp;
+    for (let i = 0; i < commitDelta; i++) {
+      await dbAdd('sessions', {domain: 'github.com', type: 'Development', startTime: Date.now(), endTime: Date.now(), durationMs: 0, xp: 30, date});
+      await dbAdd('battles', {domain: 'github.com', durationMs: 0, won: true, xp: 30, date, timestamp: Date.now()});
+    }
+    xpEarned += xp;
+    logEvents.push(`+${commitDelta} GitHub commit${commitDelta !== 1 ? 's' : ''} today (+${xp} XP)`);
+    chrome.tabs.query({ active: true }, tabs => {
+      tabs.forEach(tab => {
+        sendTabMessage(tab.id, {
+          type: 'PIKA_CELEBRATE',
+          text: `Caught ${commitDelta} new GitHub commit${commitDelta !== 1 ? 's' : ''}!`,
+          xp
+        });
+      });
+    });
+  }
+
+  t.lastGitHubTodayCommitsAwarded = Math.max(t.lastGitHubTodayCommitsAwarded || 0, t.githubTodayCommits);
+  t.level = Math.floor(t.totalXP / 500) + 1;
+  t.lastGitHubLiveSyncTime = Date.now();
+  await dbPut('trainer', t);
+
+  return { success: true, xpEarned, logEvents, fromCache: Boolean(stats.fromCache), lastGitHubLiveSyncTime: t.lastGitHubLiveSyncTime };
+}
+
+let liveGitHubRefreshPromise = null;
+
+function queueLiveGitHubRefresh(options = {}) {
+  if (liveGitHubRefreshPromise && !options.force) return liveGitHubRefreshPromise;
+  liveGitHubRefreshPromise = refreshLiveGitHub(options)
+    .catch(error => {
+      console.warn('PikaDex: GitHub live refresh skipped:', describeSyncError(error));
+      return { success: false, error: describeSyncError(error) };
+    })
+    .finally(() => {
+      liveGitHubRefreshPromise = null;
+    });
+  return liveGitHubRefreshPromise;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type==='GET_DATA') {
+    if (msg.refreshLive) {
+      queueAccountSync({ force: Boolean(msg.forceSync), ttlMs: ACCOUNT_LIVE_SYNC_TTL_MS });
+      queueLiveGitHubRefresh({ force: Boolean(msg.forceLive), ttlMs: msg.liveTtlMs });
+    }
     trackingQueue.catch(() => {})
-      .then(() => getFullDataPayload())
-      .then(({trainer,sessions,videos,battles,site_stats}) => {
-        sessions = limitForPopup(sessions);
-        videos = limitForPopup(videos);
-        battles = limitForPopup(battles);
-        site_stats = limitSiteStatsForPopup(site_stats);
-        return {trainer,sessions,videos,battles,site_stats};
-      })
+      .then(() => getPopupDataPayload())
       .then(async ({trainer,sessions,videos,battles,site_stats}) => {
         // Fetch current active session and video from storage
-        const storage = await chrome.storage.local.get(['currentSession', 'currentVideo']);
+        const storage = await storageGet(['currentSession', 'currentVideo']);
         
         let liveXp = 0;
         let liveFocusMs = 0;
         if (storage.currentSession) {
           const sess = storage.currentSession;
-          const durationMs = Math.round((sess.accumulatedSeconds || 0) * 1000);
+          const durationMs = getTodayLiveSessionMs(sess);
           const info = getSiteInfo(sess.domain);
           const mins = durationMs / 60000;
           const xp = Math.round(mins * info.xpPerMin);
           liveXp += xp;
           liveFocusMs += durationMs;
           
-          sessions.push({
-            domain: sess.domain,
-            url: sess.url || '',
-            tabId: sess.tabId,
-            windowId: sess.windowId,
-            type: info.type,
-            startTime: sess.startTime,
-            endTime: sess.lastHeartbeatTime,
-            durationMs,
-            xp,
-            date: new Date().toDateString(),
-            inProgress: true
-          });
+          if (durationMs > 0) {
+            sessions.push({
+              domain: sess.domain,
+              url: sess.url || '',
+              tabId: sess.tabId,
+              windowId: sess.windowId,
+              type: info.type,
+              startTime: Math.max(sess.startTime, localDayStartMs(Date.now())),
+              endTime: sess.lastHeartbeatTime,
+              durationMs,
+              xp,
+              date: new Date().toDateString(),
+              inProgress: true
+            });
+          }
         }
 
         if (storage.currentVideo) {
@@ -1229,9 +2073,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         // Clone trainer to avoid mutating cached database profile directly
         const clonedTrainer = JSON.parse(JSON.stringify(trainer));
+        const sessionFocusTodayMs = sessions
+          .filter(item => item.date === new Date().toDateString())
+          .reduce((sum, item) => sum + (Number(item.durationMs) || 0), 0);
         clonedTrainer.todayXP = (clonedTrainer.todayXP || 0) + liveXp;
         clonedTrainer.totalXP = (clonedTrainer.totalXP || 0) + liveXp;
-        clonedTrainer.todayFocusMs = (clonedTrainer.todayFocusMs || 0) + liveFocusMs;
+        clonedTrainer.todayFocusMs = sessionFocusTodayMs;
         clonedTrainer.totalFocusMs = (clonedTrainer.totalFocusMs || 0) + liveFocusMs;
         clonedTrainer.level = Math.floor(clonedTrainer.totalXP/500)+1;
 
@@ -1261,11 +2108,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const leetcodeChanged = hasOwn.call(fields, 'leetcodeUsername') && fields.leetcodeUsername !== (t.leetcodeUsername || '');
       const githubChanged = hasOwn.call(fields, 'githubUsername') && fields.githubUsername !== (t.githubUsername || '');
       const trackingPausedChanged = hasOwn.call(fields, 'trackingPaused') && fields.trackingPaused !== Boolean(t.trackingPaused);
+      const partnerChanged = hasOwn.call(fields, 'partnerPokemon') && fields.partnerPokemon !== (t.partnerPokemon || 'pikachu');
 
       Object.assign(t, fields);
       if (leetcodeChanged) resetLeetCodeSyncState(t);
       if (githubChanged) resetGitHubSyncState(t);
       if (leetcodeChanged || githubChanged) t.lastSyncTime = 0;
+      if (partnerChanged) t.lastEvoStage = getCompanionEvolutionForm(t.partnerPokemon || 'pikachu', t.todayFocusMs || 0);
       await dbPut('trainer', t);
       if (trackingPausedChanged && t.trackingPaused) {
         await runTrackingTask(async () => {
@@ -1279,14 +2128,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type==='SYNC_ACCOUNTS') {
-    syncAccounts()
+    syncAccounts({ force: Boolean(msg.force) })
       .then(res => sendResponse(res))
       .catch(err => sendResponse({success:false, error:err.message}));
     return true;
   }
 
   if (msg.type==='LEETCODE_SOLVED') {
-    sendResponse({ok:true});
+    recordLiveLeetCodeSolved(msg, sender)
+      .then(res => sendResponse(res))
+      .catch(error => sendResponse({ok:false, error: describeSyncError(error)}));
     return true;
   }
 
@@ -1325,6 +2176,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 function nextMidnight() { const d=new Date(); d.setHours(24,0,0,0); return d.getTime(); }
 chrome.alarms.create('midnight', {when:nextMidnight(), periodInMinutes:1440});
 chrome.alarms.create('sync_profiles', {periodInMinutes:20});
+chrome.alarms.create('sync_github_live', {periodInMinutes:1});
 
 chrome.alarms.onAlarm.addListener(async alarm => {
   if (alarm.name==='midnight') {
@@ -1341,6 +2193,12 @@ chrome.alarms.onAlarm.addListener(async alarm => {
       await syncAccounts();
     } catch (error) {
       console.warn('PikaDex: scheduled profile sync skipped:', describeSyncError(error));
+    }
+  } else if (alarm.name === 'sync_github_live') {
+    try {
+      await queueLiveGitHubRefresh();
+    } catch (error) {
+      console.warn('PikaDex: scheduled GitHub live sync skipped:', describeSyncError(error));
     }
   }
 });
